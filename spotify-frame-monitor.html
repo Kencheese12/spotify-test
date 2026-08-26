@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Currently Playing on Spotify</title>
+    <style>
+        /* ==========================================
+           CSS: 条件①の黒い背景などデザイン設定
+           ========================================== */
+        body {
+            background-color: #000000;
+            color: #FFFFFF;
+            font-family: 'Helvetica Neue', Arial, sans-serif;
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            text-align: center;
+        }
+
+        /* ログインボタンなどのデザイン */
+        .btn {
+            background-color: #1DB954; /* Spotifyグリーン */
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 25px;
+            cursor: pointer;
+            font-weight: bold;
+            font-size: 16px;
+            margin: 10px;
+        }
+
+        .btn:hover {
+            background-color: #1ed760;
+        }
+
+        /* 条件②: 情報表示エリアのデザイン */
+        #track-container {
+            max-width: 400px;
+            padding: 20px;
+            display: none; /* 最初は情報を隠しておく */
+        }
+
+        #album-cover {
+            width: 100%;
+            max-width: 300px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 15px rgba(255, 255, 255, 0.1);
+        }
+
+        #track-name {
+            font-size: 24px;
+            font-weight: bold;
+            margin: 0 0 10px 0;
+        }
+
+        #artist-name {
+            font-size: 16px;
+            color: #B3B3B3;
+            margin: 0 0 20px 0;
+        }
+
+        .message-text {
+            color: #B3B3B3;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- ログイン前の画面 -->
+    <div id="login-container">
+        <h2>Spotifyと連携して<br>再生中の曲を表示します</h2>
+        <button class="btn" onclick="login()">Spotifyでログイン</button>
+        <div id="login-message" class="message-text"></div>
+    </div>
+
+    <!-- 情報表示エリア（曲、アーティスト、ジャケット） -->
+    <div id="track-container">
+        <img id="album-cover" src="" alt="Album Cover">
+        <h1 id="track-name"></h1>
+        <h2 id="artist-name"></h2>
+        <!-- 情報を再取得するためのボタン -->
+        <button class="btn" onclick="getCurrentlyPlaying()">情報を更新</button>
+        <div id="status-message" class="message-text"></div>
+    </div>
+
+    <script>
+        // 【重要】Client IDを入力してください
+        // PKCEフローを使うのでClient Secretは不要です
+        const CLIENT_ID = 'ここにあなたのClient_IDを貼り付けます';
+
+        // 【重要】ブラウザでこのページを開いているURLと完全に一致させ、
+        // Spotify Dashboardの「Redirect URIs」にも同じ値を登録してください
+        // （末尾の「/」の有無も揃えること）
+        //
+        // 注意: Spotifyは2025年11月27日にHTTPリダイレクトURIの受付を終了しましたが、
+        // ループバックIPアドレス（127.0.0.1 や [::1]）は例外として引き続き使えます。
+        // 「localhost」という表記はもう使えないので、必ず 127.0.0.1 と書いてください。
+        // GitHub Pagesで公開する際は、ここをそのページのHTTPS URLに書き換え、
+        // Spotify Dashboard側にも追加登録してください。
+        const REDIRECT_URI = 'http://127.0.0.1:5500/';
+
+        // 今回の通信で要求する権限（現在再生中の曲を読み取る権限）
+        const SCOPE = 'user-read-currently-playing';
+
+        // トークン関連の状態。リロードしても再ログインしなくて済むよう
+        // localStorageにも保存しておく
+        let accessToken = null;
+        let refreshToken = null;
+        let tokenExpiresAt = 0; // 有効期限（UNIXミリ秒）
+
+        const STORAGE_KEYS = {
+            verifier: 'spotify_code_verifier',
+            state: 'spotify_auth_state',
+            access: 'spotify_access_token',
+            refresh: 'spotify_refresh_token',
+            expiresAt: 'spotify_token_expires_at',
+        };
+
+        /**
+         * PKCE用: ランダムな文字列を生成する
+         */
+        function generateRandomString(length) {
+            const possible = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+            const values = crypto.getRandomValues(new Uint8Array(length));
+            return values.reduce((acc, x) => acc + possible[x % possible.length], '');
+        }
+
+        /**
+         * PKCE用: 文字列をSHA-256でハッシュ化する
+         */
+        async function sha256(plain) {
+            const encoder = new TextEncoder();
+            const data = encoder.encode(plain);
+            return window.crypto.subtle.digest('SHA-256', data);
+        }
+
+        /**
+         * PKCE用: ハッシュをBase64URL形式にエンコードする
+         */
+        function base64encode(input) {
+            return btoa(String.fromCharCode(...new Uint8Array(input)))
+                .replace(/=/g, '')
+                .replace(/\+/g, '-')
+                .replace(/\//g, '_');
+        }
+
+        /**
+         * 1. Spotifyのログインページへユーザーを案内する関数
+         *
+         * 元のコードは response_type=token（Implicit Grant Flow）を使っていましたが、
+         * このフローはSpotifyが2025年11月27日に完全に廃止したため、
+         * 現在は Authorization Code with PKCE フローに置き換えています。
+         */
+        async function login() {
+            const codeVerifier = generateRandomString(64);
+            const codeChallenge = base64encode(await sha256(codeVerifier));
+            const state = generateRandomString(16);
+
+            // コールバック時にコードと引き換えるため、また改ざん検知のために保存しておく
+            window.localStorage.setItem(STORAGE_KEYS.verifier, codeVerifier);
+            window.localStorage.setItem(STORAGE_KEYS.state, state);
+
+            const authUrl = new URL('https://accounts.spotify.com/authorize');
+            const params = {
+                response_type: 'code',
+                client_id: CLIENT_ID,
+                scope: SCOPE,
+                redirect_uri: REDIRECT_URI,
+                code_challenge_method: 'S256',
+                code_challenge: codeChallenge,
+                state: state,
+            };
+            authUrl.search = new URLSearchParams(params).toString();
+
+            window.location.href = authUrl.toString();
+        }
+
+        /**
+         * 2. 認可コードをアクセストークンと引き換える関数
+         */
+        async function exchangeCodeForToken(code) {
+            const codeVerifier = window.localStorage.getItem(STORAGE_KEYS.verifier);
+
+            const response = await fetch('https://accounts.spotify.com/api/token', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: new URLSearchParams({
+                    client_id: CLIENT_ID,
+                    grant_type: 'authorization_code',
+                    code: code,
+                    redirect_uri: REDIRECT_URI,
+                    code_verifier: codeVerifier,
+                }),
+            });
+
+            if (!response.ok) {
+                throw new Error(`トークン取得エラー: ${response.status}`);
+            }
+
+            saveTokens(await response.json());
+        }
+
+        /**
+         * 3. リフレッシュトークンでアクセストークンを更新する関数
+         *
+         * Implicit Grant Flowにはリフレッシュトークンがなく、
+         * 期限切れ（1時間）のたびに再ログインが必要でしたが、
+         * PKCEフローではリフレッシュトークンが発行されるため自動更新できます。
+         */
+        async function refreshAccessToken() {
+            if (!refreshToken) return false;
+
+            const response = await fetch('https://accounts.spotify.com/api/token', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: new URLSearchParams({
+                    client_id: CLIENT_ID,
+                    grant_type: 'refresh_token',
+                    refresh_token: refreshToken,
+                }),
+            });
+
+            if (!response.ok) return false;
+
+            saveTokens(await response.json());
+            return true;
+        }
+
+        /**
+         * トークン情報をメモリとlocalStorageの両方に保存する
+         */
+        function saveTokens(data) {
+            accessToken = data.access_token;
+            // リフレッシュトークンは毎回返るとは限らないので、来た時だけ更新する
+            if (data.refresh_token) {
+                refreshToken = data.refresh_token;
+            }
+            tokenExpiresAt = Date.now() + data.expires_in * 1000;
+
+            window.localStorage.setItem(STORAGE_KEYS.access, accessToken);
+            if (refreshToken) {
+                window.localStorage.setItem(STORAGE_KEYS.refresh, refreshToken);
+            }
+            window.localStorage.setItem(STORAGE_KEYS.expiresAt, String(tokenExpiresAt));
+            window.localStorage.removeItem(STORAGE_KEYS.verifier);
+        }
+
+        /**
+         * ログイン画面に戻す（トークン切れ・認証失敗などの場合に使用）
+         */
+        function showLoginScreen(message) {
+            accessToken = null;
+            refreshToken = null;
+            window.localStorage.removeItem(STORAGE_KEYS.access);
+            window.localStorage.removeItem(STORAGE_KEYS.refresh);
+            window.localStorage.removeItem(STORAGE_KEYS.expiresAt);
+
+            document.getElementById('track-container').style.display = 'none';
+            document.getElementById('login-container').style.display = 'block';
+            document.getElementById('login-message').textContent = message || '';
+        }
+
+        /**
+         * 4. 実際に再生中の曲情報をAPIから取得する関数
+         */
+        async function getCurrentlyPlaying() {
+            if (!accessToken) return;
+
+            const statusMsg = document.getElementById('status-message');
+            statusMsg.textContent = '読み込み中...';
+
+            // 有効期限が近い場合は先にリフレッシュしておく
+            if (Date.now() >= tokenExpiresAt - 5000) {
+                const refreshed = await refreshAccessToken();
+                if (!refreshed) {
+                    showLoginScreen('ログインの有効期限が切れました。もう一度ログインしてください。');
+                    return;
+                }
+            }
+
+            try {
+                // 再生中の曲を取得する専用のAPIを叩く
+                const response = await fetch('https://api.spotify.com/v1/me/player/currently-playing', {
+                    headers: {
+                        'Authorization': `Bearer ${accessToken}`
+                    }
+                });
+
+                // アクセストークンが無効な場合は再ログインを促す
+                if (response.status === 401) {
+                    showLoginScreen('ログインの有効期限が切れました。もう一度ログインしてください。');
+                    return;
+                }
+
+                // Spotifyを開いていない、または何も再生していない場合は 204 が返る
+                if (response.status === 204) {
+                    statusMsg.textContent = '現在Spotifyで何も再生されていません。曲を再生してから「情報を更新」を押してください。';
+                    return;
+                }
+
+                if (!response.ok) {
+                    throw new Error(`エラー: ${response.status}`);
+                }
+
+                const data = await response.json();
+
+                // 取得したデータ（現在再生中のアイテム）が「曲」かどうかチェック
+                if (data.item && data.currently_playing_type === 'track') {
+                    const track = data.item;
+
+                    // 画面に情報をセット
+                    document.getElementById('track-name').textContent = track.name;
+                    document.getElementById('artist-name').textContent = track.artists.map(a => a.name).join(', ');
+
+                    if (track.album && track.album.images.length > 0) {
+                        document.getElementById('album-cover').src = track.album.images[0].url;
+                    }
+
+                    statusMsg.textContent = ''; // メッセージをクリア
+                } else {
+                    statusMsg.textContent = 'ポッドキャストなどを再生中、もしくは曲情報を取得できません。';
+                }
+
+            } catch (error) {
+                console.error(error);
+                statusMsg.textContent = '情報の取得に失敗しました。時間をおいて再試行するか、再度ログインしてください。';
+            }
+        }
+
+        /**
+         * ページ読み込み時に実行されるメイン処理
+         */
+        window.onload = async () => {
+            const urlParams = new URLSearchParams(window.location.search);
+            const code = urlParams.get('code');
+            const authError = urlParams.get('error');
+            const returnedState = urlParams.get('state');
+
+            // 認可コード（または認証エラー）付きで戻ってきた場合は、URLのクエリを消して綺麗にする
+            if (code || authError) {
+                window.history.replaceState(null, null, window.location.pathname);
+            }
+
+            if (authError) {
+                showLoginScreen('Spotifyの認証が許可されませんでした。もう一度お試しください。');
+                return;
+            }
+
+            try {
+                if (code) {
+                    // CSRF対策: リクエスト時に保存したstateと一致するか確認
+                    const savedState = window.localStorage.getItem(STORAGE_KEYS.state);
+                    window.localStorage.removeItem(STORAGE_KEYS.state);
+
+                    if (!savedState || returnedState !== savedState) {
+                        showLoginScreen('認証の検証に失敗しました。もう一度ログインしてください。');
+                        return;
+                    }
+
+                    // 認可コードが付いて戻ってきた＝ログイン直後。アクセストークンと交換する
+                    await exchangeCodeForToken(code);
+                } else {
+                    // 保存済みのトークンがあれば読み込む（リロードのたびに再ログインしなくて済むように）
+                    accessToken = window.localStorage.getItem(STORAGE_KEYS.access);
+                    refreshToken = window.localStorage.getItem(STORAGE_KEYS.refresh);
+                    tokenExpiresAt = Number(window.localStorage.getItem(STORAGE_KEYS.expiresAt) || 0);
+                }
+
+                if (accessToken) {
+                    document.getElementById('login-container').style.display = 'none';
+                    document.getElementById('track-container').style.display = 'block';
+                    getCurrentlyPlaying();
+                }
+            } catch (error) {
+                console.error(error);
+                showLoginScreen('ログイン処理に失敗しました。もう一度お試しください。');
+            }
+        };
+    </script>
+</body>
+</html>
