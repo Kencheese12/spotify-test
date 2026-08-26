@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Currently Playing on Spotify</title>
+    <style>
+        /* ==========================================
+           CSS: 条件①の黒い背景などデザイン設定
+           ========================================== */
+        body {
+            background-color: #000000;
+            color: #FFFFFF;
+            font-family: 'Helvetica Neue', Arial, sans-serif;
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            text-align: center;
+        }
+
+        /* ログインボタンなどのデザイン */
+        .btn {
+            background-color: #1DB954; /* Spotifyグリーン */
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 25px;
+            cursor: pointer;
+            font-weight: bold;
+            font-size: 16px;
+            margin: 10px;
+        }
+
+        .btn:hover {
+            background-color: #1ed760;
+        }
+
+        /* 条件②: 情報表示エリアのデザイン */
+        #track-container {
+            max-width: 400px;
+            padding: 20px;
+            display: none; /* 最初は情報を隠しておく */
+        }
+
+        #album-cover {
+            width: 100%;
+            max-width: 300px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 15px rgba(255, 255, 255, 0.1);
+        }
+
+        #track-name {
+            font-size: 24px;
+            font-weight: bold;
+            margin: 0 0 10px 0;
+        }
+
+        #artist-name {
+            font-size: 16px;
+            color: #B3B3B3;
+            margin: 0 0 20px 0;
+        }
+
+        .message-text {
+            color: #B3B3B3;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- ログイン前の画面 -->
+    <div id="login-container">
+        <h2>Spotifyと連携して<br>再生中の曲を表示します</h2>
+        <button class="btn" onclick="login()">Spotifyでログイン</button>
+    </div>
+
+    <!-- 情報表示エリア（曲、アーティスト、ジャケット） -->
+    <div id="track-container">
+        <img id="album-cover" src="" alt="Album Cover">
+        <h1 id="track-name"></h1>
+        <h2 id="artist-name"></h2>
+        <!-- 情報を再取得するためのボタン -->
+        <button class="btn" onclick="getCurrentlyPlaying()">情報を更新</button>
+        <div id="status-message" class="message-text"></div>
+    </div>
+
+    <script>
+        // 【重要】Client IDを入力してください（Secretは今回は不要です）
+        const CLIENT_ID = '9542e196baa64cc09c0659260326a144';
+        
+        // 【重要】ブラウザでこのページを開いているURLと完全に一致させる必要があります
+        // 末尾の「/」があるかないかも含めて、Spotify Dashboardに登録したものと揃えてください
+        const REDIRECT_URI = 'http://127.0.0.1:5500/'; 
+        
+        // 今回の通信で要求する権限（現在再生中の曲を読み取る権限）
+        const SCOPE = 'user-read-currently-playing';
+
+        let accessToken = null;
+
+        /**
+         * 1. Spotifyのログインページへユーザーを案内する関数
+         */
+        function login() {
+            // Implicit Grant Flow という認証方式のURLを生成します
+            const authUrl = `https://accounts.spotify.com/authorize?client_id=${CLIENT_ID}&response_type=token&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&scope=${encodeURIComponent(SCOPE)}`;
+            
+            // Spotifyの認証ページへ移動
+            window.location.href = authUrl;
+        }
+
+        /**
+         * 2. URLに付与されたアクセストークンを抽出する関数
+         */
+        function getAccessTokenFromUrl() {
+            // ログイン後、URLの # 以降にトークンが付与されて戻ってきます
+            const hash = window.location.hash;
+            if (hash) {
+                // 文字列を解析してアクセストークンだけを取り出す
+                const params = new URLSearchParams(hash.substring(1));
+                const token = params.get('access_token');
+                
+                // URLからハッシュを消去して見た目を綺麗にする（セキュリティ対策にもなります）
+                window.history.replaceState(null, null, window.location.pathname);
+                return token;
+            }
+            return null;
+        }
+
+        /**
+         * 3. 実際に再生中の曲情報をAPIから取得する関数
+         */
+        async function getCurrentlyPlaying() {
+            if (!accessToken) return;
+
+            const statusMsg = document.getElementById('status-message');
+            statusMsg.textContent = '読み込み中...';
+
+            try {
+                // 再生中の曲を取得する専用のAPIを叩く
+                const response = await fetch('https://api.spotify.com/v1/me/player/currently-playing', {
+                    headers: {
+                        'Authorization': `Bearer ${accessToken}`
+                    }
+                });
+
+                // Spotifyを開いていない、または何も再生していない場合は 204 が返る
+                if (response.status === 204) {
+                    statusMsg.textContent = '現在Spotifyで何も再生されていません。曲を再生してから「情報を更新」を押してください。';
+                    return;
+                }
+
+                if (!response.ok) {
+                    throw new Error(`エラー: ${response.status}`);
+                }
+
+                const data = await response.json();
+
+                // 取得したデータ（現在再生中のアイテム）が「曲」かどうかチェック
+                if (data.item && data.currently_playing_type === 'track') {
+                    const track = data.item;
+                    
+                    // 画面に情報をセット
+                    document.getElementById('track-name').textContent = track.name;
+                    document.getElementById('artist-name').textContent = track.artists.map(a => a.name).join(', ');
+                    
+                    if (track.album && track.album.images.length > 0) {
+                        document.getElementById('album-cover').src = track.album.images[0].url;
+                    }
+                    
+                    statusMsg.textContent = ''; // メッセージをクリア
+                } else {
+                    statusMsg.textContent = 'ポッドキャストなどを再生中、もしくは曲情報を取得できません。';
+                }
+
+            } catch (error) {
+                console.error(error);
+                statusMsg.textContent = '情報の取得に失敗しました。時間をおいて再試行するか、再度ログインしてください。';
+            }
+        }
+
+        /**
+         * ページ読み込み時に実行されるメイン処理
+         */
+        window.onload = () => {
+            // URLからトークンを取得してみる
+            accessToken = getAccessTokenFromUrl();
+
+            if (accessToken) {
+                // トークンがあれば（ログイン成功直後なら）、ログイン画面を隠して曲情報を取得
+                document.getElementById('login-container').style.display = 'none';
+                document.getElementById('track-container').style.display = 'block';
+                getCurrentlyPlaying();
+            }
+            // トークンがなければ初期状態（ログインボタン表示）のまま
+        };
+    </script>
+</body>
+</html>
