@@ -40,8 +40,10 @@
 
         /* 条件②: 情報表示エリアのデザイン */
         #track-container {
+            width: 100%;
             max-width: 400px;
             padding: 20px;
+            box-sizing: border-box;
             display: none; /* 最初は情報を隠しておく */
         }
 
@@ -51,6 +53,10 @@
             border-radius: 8px;
             margin-bottom: 20px;
             box-shadow: 0 4px 15px rgba(255, 255, 255, 0.1);
+        }
+
+        #album-cover[hidden] {
+            display: none;
         }
 
         #track-name {
@@ -63,6 +69,63 @@
             font-size: 16px;
             color: #B3B3B3;
             margin: 0 0 20px 0;
+        }
+
+        /* シークバー */
+        #progress-container {
+            width: 100%;
+            max-width: 300px;
+            margin: 0 auto 10px auto;
+        }
+
+        #progress-container[hidden] {
+            display: none;
+        }
+
+        #seek-bar {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 100%;
+            height: 4px;
+            margin: 0;
+            border-radius: 2px;
+            outline: none;
+            cursor: pointer;
+            background: linear-gradient(
+                to right,
+                #1DB954 var(--progress, 0%),
+                #4D4D4D var(--progress, 0%)
+            );
+        }
+
+        #seek-bar::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #FFFFFF;
+        }
+
+        #seek-bar::-moz-range-thumb {
+            width: 12px;
+            height: 12px;
+            border: none;
+            border-radius: 50%;
+            background: #FFFFFF;
+        }
+
+        #seek-bar::-moz-range-track {
+            background: transparent;
+        }
+
+        .time-row {
+            display: flex;
+            justify-content: space-between;
+            font-size: 12px;
+            color: #B3B3B3;
+            margin-top: 6px;
+            font-variant-numeric: tabular-nums;
         }
 
         .message-text {
@@ -80,34 +143,47 @@
         <div id="login-message" class="message-text"></div>
     </div>
 
-    <!-- 情報表示エリア（曲、アーティスト、ジャケット） -->
+    <!-- 情報表示エリア（曲、アーティスト、ジャケット、シークバー） -->
     <div id="track-container">
-        <img id="album-cover" src="" alt="Album Cover">
+        <img id="album-cover" alt="Album Cover" hidden>
         <h1 id="track-name"></h1>
         <h2 id="artist-name"></h2>
-        <!-- 情報を再取得するためのボタン -->
-        <button class="btn" onclick="getCurrentlyPlaying()">情報を更新</button>
+
+        <!-- シークバー（ドラッグで再生位置を変更。Premiumのみ） -->
+        <div id="progress-container" hidden>
+            <input type="range" id="seek-bar" min="0" max="0" value="0" step="1000">
+            <div class="time-row">
+                <span id="current-time">0:00</span>
+                <span id="duration">0:00</span>
+            </div>
+        </div>
+
+        <!-- 手動で情報を再取得するためのボタン（自動更新もあり） -->
+        <button class="btn" onclick="getCurrentlyPlaying(true)">情報を更新</button>
         <div id="status-message" class="message-text"></div>
     </div>
 
     <script>
-        // 【重要】Client IDを入力してください
-        // PKCEフローを使うのでClient Secretは不要です
+        // Spotify DashboardのClient ID
+        // PKCEフローを使うのでClient Secretは不要（公開しても問題ない）
         const CLIENT_ID = '9542e196baa64cc09c0659260326a144';
 
-        // 【重要】ブラウザでこのページを開いているURLと完全に一致させ、
-        // Spotify Dashboardの「Redirect URIs」にも同じ値を登録してください
-        // （末尾の「/」の有無も揃えること）
-        //
-        // 注意: Spotifyは2025年11月27日にHTTPリダイレクトURIの受付を終了しましたが、
-        // ループバックIPアドレス（127.0.0.1 や [::1]）は例外として引き続き使えます。
-        // 「localhost」という表記はもう使えないので、必ず 127.0.0.1 と書いてください。
-        // GitHub Pagesで公開する際は、ここをそのページのHTTPS URLに書き換え、
-        // Spotify Dashboard側にも追加登録してください。
+        // GitHub Pagesの公開URL
+        // Spotify Dashboardの「Redirect URIs」にも同じ値を登録すること（末尾の「/」も一致させる）
         const REDIRECT_URI = 'https://kencheese12.github.io/spotify-test/';
 
-        // 今回の通信で要求する権限（現在再生中の曲を読み取る権限）
-        const SCOPE = 'user-read-currently-playing';
+        // 要求する権限
+        // user-read-currently-playing: 再生中の曲を読み取る
+        // user-modify-playback-state: 再生位置を変更する（シーク。Premiumのみ有効）
+        const SCOPE = 'user-read-currently-playing user-modify-playback-state';
+
+        // 曲情報の自動取得の間隔（ミリ秒）
+        const POLL_INTERVAL_MS = 15000;
+
+        // シークバーの描画間隔（ミリ秒）
+        const TICK_INTERVAL_MS = 500;
+
+        const EXPIRED_MESSAGE = 'ログインの有効期限が切れました。もう一度ログインしてください。';
 
         // トークン関連の状態。リロードしても再ログインしなくて済むよう
         // localStorageにも保存しておく
@@ -115,12 +191,28 @@
         let refreshToken = null;
         let tokenExpiresAt = 0; // 有効期限（UNIXミリ秒）
 
+        // 自動更新用の状態
+        let pollTimer = null;
+        let tickTimer = null;
+        let isFetching = false;
+        let lastEndFetchAt = 0;
+
+        // 再生位置の状態（API取得時点の値と取得時刻から現在位置を計算する）
+        const playback = {
+            progressMs: 0,
+            durationMs: 0,
+            isPlaying: false,
+            fetchedAt: 0,
+        };
+        let isSeeking = false; // ユーザーがシークバーを操作中か
+
         const STORAGE_KEYS = {
             verifier: 'spotify_code_verifier',
             state: 'spotify_auth_state',
             access: 'spotify_access_token',
             refresh: 'spotify_refresh_token',
             expiresAt: 'spotify_token_expires_at',
+            scope: 'spotify_granted_scope',
         };
 
         /**
@@ -152,11 +244,16 @@
         }
 
         /**
-         * 1. Spotifyのログインページへユーザーを案内する関数
-         *
-         * 元のコードは response_type=token（Implicit Grant Flow）を使っていましたが、
-         * このフローはSpotifyが2025年11月27日に完全に廃止したため、
-         * 現在は Authorization Code with PKCE フローに置き換えています。
+         * 保存済みの権限に、必要な権限がすべて含まれているか確認する
+         */
+        function hasRequiredScopes(grantedScope) {
+            if (!grantedScope) return false;
+            const granted = grantedScope.split(' ');
+            return SCOPE.split(' ').every(s => granted.includes(s));
+        }
+
+        /**
+         * 1. Spotifyのログインページへユーザーを案内する（Authorization Code with PKCE）
          */
         async function login() {
             const codeVerifier = generateRandomString(64);
@@ -183,7 +280,7 @@
         }
 
         /**
-         * 2. 認可コードをアクセストークンと引き換える関数
+         * 2. 認可コードをアクセストークンと引き換える
          */
         async function exchangeCodeForToken(code) {
             const codeVerifier = window.localStorage.getItem(STORAGE_KEYS.verifier);
@@ -208,29 +305,30 @@
         }
 
         /**
-         * 3. リフレッシュトークンでアクセストークンを更新する関数
-         *
-         * Implicit Grant Flowにはリフレッシュトークンがなく、
-         * 期限切れ（1時間）のたびに再ログインが必要でしたが、
-         * PKCEフローではリフレッシュトークンが発行されるため自動更新できます。
+         * 3. リフレッシュトークンでアクセストークンを更新する
          */
         async function refreshAccessToken() {
             if (!refreshToken) return false;
 
-            const response = await fetch('https://accounts.spotify.com/api/token', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                body: new URLSearchParams({
-                    client_id: CLIENT_ID,
-                    grant_type: 'refresh_token',
-                    refresh_token: refreshToken,
-                }),
-            });
+            try {
+                const response = await fetch('https://accounts.spotify.com/api/token', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: new URLSearchParams({
+                        client_id: CLIENT_ID,
+                        grant_type: 'refresh_token',
+                        refresh_token: refreshToken,
+                    }),
+                });
 
-            if (!response.ok) return false;
+                if (!response.ok) return false;
 
-            saveTokens(await response.json());
-            return true;
+                saveTokens(await response.json());
+                return true;
+            } catch (error) {
+                console.error(error);
+                return false;
+            }
         }
 
         /**
@@ -249,18 +347,95 @@
                 window.localStorage.setItem(STORAGE_KEYS.refresh, refreshToken);
             }
             window.localStorage.setItem(STORAGE_KEYS.expiresAt, String(tokenExpiresAt));
+            if (data.scope) {
+                window.localStorage.setItem(STORAGE_KEYS.scope, data.scope);
+            }
             window.localStorage.removeItem(STORAGE_KEYS.verifier);
+        }
+
+        /**
+         * 有効期限が近ければ先にリフレッシュしておく
+         */
+        async function ensureValidToken() {
+            if (Date.now() < tokenExpiresAt - 5000) return true;
+            return refreshAccessToken();
+        }
+
+        /**
+         * Spotify APIを呼ぶ共通関数
+         * 401の場合は一度だけリフレッシュして再試行する。
+         * ログアウト扱いになった場合は null を返す
+         */
+        async function spotifyFetch(url, options = {}) {
+            if (!(await ensureValidToken())) {
+                showLoginScreen(EXPIRED_MESSAGE);
+                return null;
+            }
+
+            const doFetch = () => fetch(url, {
+                ...options,
+                headers: {
+                    ...(options.headers || {}),
+                    'Authorization': `Bearer ${accessToken}`,
+                },
+            });
+
+            let response = await doFetch();
+
+            if (response.status === 401) {
+                if (!(await refreshAccessToken())) {
+                    showLoginScreen(EXPIRED_MESSAGE);
+                    return null;
+                }
+                response = await doFetch();
+                if (response.status === 401) {
+                    showLoginScreen(EXPIRED_MESSAGE);
+                    return null;
+                }
+            }
+
+            return response;
+        }
+
+        /**
+         * 自動更新を開始する（タブが非表示の間はAPIを叩かない）
+         */
+        function startPolling() {
+            stopPolling();
+            pollTimer = setInterval(() => {
+                if (!document.hidden) {
+                    getCurrentlyPlaying();
+                }
+            }, POLL_INTERVAL_MS);
+            tickTimer = setInterval(tick, TICK_INTERVAL_MS);
+        }
+
+        /**
+         * 自動更新を停止する
+         */
+        function stopPolling() {
+            if (pollTimer) {
+                clearInterval(pollTimer);
+                pollTimer = null;
+            }
+            if (tickTimer) {
+                clearInterval(tickTimer);
+                tickTimer = null;
+            }
         }
 
         /**
          * ログイン画面に戻す（トークン切れ・認証失敗などの場合に使用）
          */
         function showLoginScreen(message) {
+            stopPolling();
             accessToken = null;
             refreshToken = null;
+            tokenExpiresAt = 0;
             window.localStorage.removeItem(STORAGE_KEYS.access);
             window.localStorage.removeItem(STORAGE_KEYS.refresh);
             window.localStorage.removeItem(STORAGE_KEYS.expiresAt);
+            window.localStorage.removeItem(STORAGE_KEYS.scope);
 
             document.getElementById('track-container').style.display = 'none';
             document.getElementById('login-container').style.display = 'block';
@@ -268,40 +443,178 @@
         }
 
         /**
-         * 4. 実際に再生中の曲情報をAPIから取得する関数
+         * 曲情報の表示エリアを表示し、自動更新を開始する
          */
-        async function getCurrentlyPlaying() {
-            if (!accessToken) return;
+        function showTrackScreen() {
+            document.getElementById('login-container').style.display = 'none';
+            document.getElementById('track-container').style.display = 'block';
+            getCurrentlyPlaying(true);
+            startPolling();
+        }
 
+        /**
+         * ジャケット画像を表示する（画像がなければ非表示にして前の曲の画像を残さない）
+         */
+        function setAlbumCover(track) {
+            const cover = document.getElementById('album-cover');
+            if (track.album && track.album.images && track.album.images.length > 0) {
+                cover.src = track.album.images[0].url;
+                cover.hidden = false;
+            } else {
+                cover.removeAttribute('src');
+                cover.hidden = true;
+            }
+        }
+
+        /**
+         * ミリ秒を「m:ss」形式に変換する
+         */
+        function formatTime(ms) {
+            const totalSec = Math.max(0, Math.floor(ms / 1000));
+            const min = Math.floor(totalSec / 60);
+            const sec = totalSec % 60;
+            return `${min}:${String(sec).padStart(2, '0')}`;
+        }
+
+        /**
+         * 現在の再生位置を計算する（再生中なら取得時刻からの経過分を足す）
+         */
+        function currentProgressMs() {
+            if (!playback.isPlaying) return playback.progressMs;
+            const elapsed = Date.now() - playback.fetchedAt;
+            return Math.min(playback.progressMs + elapsed, playback.durationMs);
+        }
+
+        /**
+         * シークバーと時間表示を描画する
+         */
+        function renderProgress(ms) {
+            const seekBar = document.getElementById('seek-bar');
+            const duration = playback.durationMs;
+            const percent = duration > 0 ? (ms / duration) * 100 : 0;
+
+            seekBar.max = String(duration);
+            seekBar.value = String(ms);
+            seekBar.style.setProperty('--progress', `${percent}%`);
+
+            document.getElementById('current-time').textContent = formatTime(ms);
+            document.getElementById('duration').textContent = formatTime(duration);
+        }
+
+        /**
+         * シークバーを表示/非表示にする
+         */
+        function setProgressVisible(visible) {
+            document.getElementById('progress-container').hidden = !visible;
+            if (!visible) {
+                playback.isPlaying = false;
+            }
+        }
+
+        /**
+         * 定期的にシークバーを進める。曲の終わりに達したら次の曲を取得する
+         */
+        function tick() {
+            if (isSeeking || playback.durationMs === 0) return;
+
+            const ms = currentProgressMs();
+            renderProgress(ms);
+
+            // 曲の終わりに達したら、15秒待たずに次の曲を取りに行く（連打防止で3秒空ける）
+            if (playback.isPlaying && ms >= playback.durationMs && !document.hidden) {
+                const now = Date.now();
+                if (now - lastEndFetchAt > 3000) {
+                    lastEndFetchAt = now;
+                    getCurrentlyPlaying();
+                }
+            }
+        }
+
+        /**
+         * 指定した位置へシークする（Spotify Premiumのみ）
+         */
+        async function seekTo(positionMs) {
             const statusMsg = document.getElementById('status-message');
-            statusMsg.textContent = '読み込み中...';
+            const position = Math.floor(positionMs);
 
-            // 有効期限が近い場合は先にリフレッシュしておく
-            if (Date.now() >= tokenExpiresAt - 5000) {
-                const refreshed = await refreshAccessToken();
-                if (!refreshed) {
-                    showLoginScreen('ログインの有効期限が切れました。もう一度ログインしてください。');
+            try {
+                const response = await spotifyFetch(
+                    `https://api.spotify.com/v1/me/player/seek?position_ms=${position}`,
+                    { method: 'PUT' }
+                );
+                if (!response) return;
+
+                if (response.status === 403) {
+                    statusMsg.textContent = 'シーク操作にはSpotify Premiumが必要です。';
                     return;
                 }
+
+                if (response.status === 404) {
+                    statusMsg.textContent = '再生中のデバイスが見つかりません。Spotifyアプリで再生してから操作してください。';
+                    return;
+                }
+
+                if (!response.ok) {
+                    throw new Error(`シークエラー: ${response.status}`);
+                }
+
+                // 成功したら手元の再生位置も更新しておく
+                playback.progressMs = position;
+                playback.fetchedAt = Date.now();
+                statusMsg.textContent = playback.isPlaying ? '' : '一時停止中';
+            } catch (error) {
+                console.error(error);
+                statusMsg.textContent = '再生位置の変更に失敗しました。';
+            } finally {
+                isSeeking = false;
+                renderProgress(currentProgressMs());
+                // Spotify側の反映を待ってから実際の位置を取り直す
+                setTimeout(() => getCurrentlyPlaying(), 1000);
+            }
+        }
+
+        /**
+         * シークバーの操作イベントを登録する
+         */
+        function setupSeekBar() {
+            const seekBar = document.getElementById('seek-bar');
+
+            // ドラッグ中: 表示だけ更新し、自動で進むのを止める
+            seekBar.addEventListener('input', () => {
+                isSeeking = true;
+                const ms = Number(seekBar.value);
+                const percent = playback.durationMs > 0 ? (ms / playback.durationMs) * 100 : 0;
+                seekBar.style.setProperty('--progress', `${percent}%`);
+                document.getElementById('current-time').textContent = formatTime(ms);
+            });
+
+            // 指を離した時点でシークを実行
+            seekBar.addEventListener('change', () => {
+                seekTo(Number(seekBar.value));
+            });
+        }
+
+        /**
+         * 4. 再生中の曲情報を取得して画面に反映する
+         * manual = true のとき（ボタン押下・初回）だけ「読み込み中...」を表示する
+         */
+        async function getCurrentlyPlaying(manual = false) {
+            if (!accessToken || isFetching) return;
+            isFetching = true;
+
+            const statusMsg = document.getElementById('status-message');
+            if (manual) {
+                statusMsg.textContent = '読み込み中...';
             }
 
             try {
-                // 再生中の曲を取得する専用のAPIを叩く
-                const response = await fetch('https://api.spotify.com/v1/me/player/currently-playing', {
-                    headers: {
-                        'Authorization': `Bearer ${accessToken}`
-                    }
-                });
-
-                // アクセストークンが無効な場合は再ログインを促す
-                if (response.status === 401) {
-                    showLoginScreen('ログインの有効期限が切れました。もう一度ログインしてください。');
-                    return;
-                }
+                const response = await spotifyFetch('https://api.spotify.com/v1/me/player/currently-playing');
+                if (!response) return;
 
                 // Spotifyを開いていない、または何も再生していない場合は 204 が返る
                 if (response.status === 204) {
-                    statusMsg.textContent = '現在Spotifyで何も再生されていません。曲を再生してから「情報を更新」を押してください。';
+                    setProgressVisible(false);
+                    statusMsg.textContent = '現在Spotifyで何も再生されていません。';
                     return;
                 }
 
@@ -315,29 +628,50 @@
                 if (data.item && data.currently_playing_type === 'track') {
                     const track = data.item;
 
-                    // 画面に情報をセット
                     document.getElementById('track-name').textContent = track.name;
                     document.getElementById('artist-name').textContent = track.artists.map(a => a.name).join(', ');
+                    setAlbumCover(track);
 
-                    if (track.album && track.album.images.length > 0) {
-                        document.getElementById('album-cover').src = track.album.images[0].url;
+                    // 再生位置を更新
+                    playback.progressMs = data.progress_ms || 0;
+                    playback.durationMs = track.duration_ms || 0;
+                    playback.isPlaying = Boolean(data.is_playing);
+                    playback.fetchedAt = Date.now();
+
+                    setProgressVisible(true);
+                    if (!isSeeking) {
+                        renderProgress(currentProgressMs());
                     }
 
-                    statusMsg.textContent = ''; // メッセージをクリア
+                    statusMsg.textContent = playback.isPlaying ? '' : '一時停止中';
                 } else {
+                    setProgressVisible(false);
                     statusMsg.textContent = 'ポッドキャストなどを再生中、もしくは曲情報を取得できません。';
                 }
 
             } catch (error) {
                 console.error(error);
                 statusMsg.textContent = '情報の取得に失敗しました。時間をおいて再試行するか、再度ログインしてください。';
+            } finally {
+                isFetching = false;
             }
         }
+
+        /**
+         * タブに戻ってきたらすぐ最新情報を取得する
+         */
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden && accessToken && pollTimer) {
+                getCurrentlyPlaying();
+            }
+        });
 
         /**
          * ページ読み込み時に実行されるメイン処理
          */
         window.onload = async () => {
+            setupSeekBar();
+
             const urlParams = new URLSearchParams(window.location.search);
             const code = urlParams.get('code');
             const authError = urlParams.get('error');
@@ -364,19 +698,24 @@
                         return;
                     }
 
-                    // 認可コードが付いて戻ってきた＝ログイン直後。アクセストークンと交換する
+                    // ログイン直後。認可コードをアクセストークンと交換する
                     await exchangeCodeForToken(code);
                 } else {
-                    // 保存済みのトークンがあれば読み込む（リロードのたびに再ログインしなくて済むように）
+                    // 保存済みのトークンがあれば読み込む
                     accessToken = window.localStorage.getItem(STORAGE_KEYS.access);
                     refreshToken = window.localStorage.getItem(STORAGE_KEYS.refresh);
                     tokenExpiresAt = Number(window.localStorage.getItem(STORAGE_KEYS.expiresAt) || 0);
+
+                    // 権限が足りない古いトークンなら再ログインしてもらう
+                    const grantedScope = window.localStorage.getItem(STORAGE_KEYS.scope);
+                    if (accessToken && !hasRequiredScopes(grantedScope)) {
+                        showLoginScreen('シーク機能を追加したため、もう一度ログインしてください。');
+                        return;
+                    }
                 }
 
                 if (accessToken) {
-                    document.getElementById('login-container').style.display = 'none';
-                    document.getElementById('track-container').style.display = 'block';
-                    getCurrentlyPlaying();
+                    showTrackScreen();
                 }
             } catch (error) {
                 console.error(error);
